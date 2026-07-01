@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "workflow_config — visual step-builder agent contract (v1)",
+  "description": "Contract between the UI builder (Langflow canvas in the UI repo) and the voice worker. The UI repo translates the Langflow canvas into THIS format on save; raw Langflow export JSON is never stored. RUNTIME (ADR-011): the worker runs this as a HYBRID native control-plane — a plain-Python interpreter owns routing + state, while each step is a full native LiveKit agent whose prompt + tools are swapped in on a step change. There is NO LangGraph/LLMAdapter; tools therefore run NATIVELY (see agent_tool_ref note: escalate IS allowed) and the per-step model override is parsed but not applied in v1. Stored as a nullable field in the agent settings config; when absent (or ENABLE_CONVERSATION_FLOW off) the agent runs the classic single-prompt pipeline. Cross-references that JSON Schema cannot express (entry_step is an llm step in steps[], transitions[].to targets an existing step id, steps[].tools entries name a tools[] item, collect entries name a state_fields[] item, step ids unique, tool names unique) are validated by the worker at config-parse time and reject the session with AgentConfigurationError.",
+  "type": "object",
+  "required": ["schema_version", "entry_step", "routing", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Contract version. The worker rejects versions it does not support; bump only with a coordinated worker release."
+    },
+    "entry_step": {
+      "type": "string",
+      "description": "Id of the step where every new conversation starts. Must match the id of one llm step in steps[]."
+    },
+    "routing": {
+      "$ref": "#/$defs/routing",
+      "description": "REQUIRED wording for the ephemeral go_to_* routing tools the runtime builds per step (and the directive returned after a transition). The worker hard-codes no routing prose — every field below is authored here and required."
+    },
+    "shared_prompt": {
+      "type": "string",
+      "description": "Optional global prompt prefix prepended to EVERY step's prompt (entry install and each step swap), through the same {Variable}/{state.<field>} substitution. Each step.prompt replaces the agent's base system prompt, so persona/knowledge-base/always-on rules that all steps share belong here once instead of being copied into every step. Each step.prompt then carries only its task-specific delta."
+    },
+    "state_fields": {
+      "type": "array",
+      "default": [],
+      "description": "Typed slots collected during the conversation. They live in the LangGraph state (persisted across turns via the per-session checkpointer), are readable by later steps' prompts as {state.<name>}, and are exported to the end-of-call metadata extractor.",
+      "items": { "$ref": "#/$defs/state_field" }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Workflow nodes. Exactly one graph node per step. Step ids must be unique (across steps[] AND global_steps[] — one shared id namespace).",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/llm_step" },
+          { "$ref": "#/$defs/end_step" }
+        ]
+      }
+    },
+    "global_steps": {
+      "type": "array",
+      "default": [],
+      "description": "Global nodes: zero or more steps reachable from EVERY llm step without an explicit transition edge — the outgoing-edge analogue of shared_prompt. Each carries a single 'when' predicate authored once; the runtime synthesizes a go_to_<id> transition tool onto every in-scope llm step (those not listed in the node's 'exclude'). The canonical use is an exit condition (e.g. a say_goodbye end node any step can take), which keeps the explicit graph small. An llm step's own explicit transition to a global node's id takes precedence over the synthesized one (the explicit 'when' is used). Ids share the steps[] namespace and must be unique; entry_step may NOT be a global node.",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/global_llm_step" },
+          { "$ref": "#/$defs/global_end_step" }
+        ]
+      }
+    },
+    "tools": {
+      "type": "array",
+      "default": [],
+      "description": "Tool definitions referenced by steps[].tools. Tools execute INSIDE the LangGraph (LangChain tools), not through the classic LiveKit tool pipeline — pre_execution_speech and the classic tool timeout config do not apply. Tool names must be unique.",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/http_tool" },
+          { "$ref": "#/$defs/agent_tool_ref" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "description": "Lowercase snake_case identifier, max 64 chars."
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledgment_required",
+        "acknowledgment_description",
+        "transition_description_template",
+        "continuation_directive",
+        "continuation_directive_no_filler"
+      ],
+      "description": "Wording for the runtime's ephemeral go_to_* transition tools. These schemas are sent to the LLM on every turn a step is active. The worker hard-codes none of this prose — all fields are authored here and required, so the JSON editor is the single source of truth.",
+      "properties": {
+        "acknowledgment_required": {
+          "type": "boolean",
+          "description": "Whether transition tools require an 'acknowledgment' filler argument. false: transitions carry no filler and switch silently (no masking phrase is spoken)."
+        },
+        "acknowledgment_description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Description of the 'acknowledgment' argument on each transition tool — a short filler the model writes and the worker speaks immediately to mask the step-swap latency. Write it for the LLM. (Still required even when acknowledgment_required is false.)"
+        },
+        "transition_description_template": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Description template for each go_to_* tool. The single placeholder {when} is filled with that transition's 'when' predicate. Must be a valid Python str.format string with no other placeholders."
+        },
+        "continuation_directive": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tool result returned to the LLM after a transition WHEN a filler was spoken, steering the continuation reply (e.g. not to re-greet). Becomes part of history."
+        },
+        "continuation_directive_no_filler": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tool result returned after a transition WHEN no filler was spoken (acknowledgment_required=false or the model omitted it)."
+        }
+      }
+    },
+    "routing_override": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Node-level override of the flow-level routing — the same fields, all OPTIONAL. Set on an llm step to override routing for transitions leaving that node; omitted fields inherit the flow-level value. Same field meanings as #/$defs/routing.",
+      "properties": {
+        "acknowledgment_required": { "type": "boolean" },
+        "acknowledgment_description": { "type": "string", "minLength": 1 },
+        "transition_description_template": { "type": "string", "minLength": 1 },
+        "continuation_directive": { "type": "string", "minLength": 1 },
+        "continuation_directive_no_filler": { "type": "string", "minLength": 1 }
+      }
+    },
+    "state_field": {
+      "type": "object",
+      "required": ["name", "type", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/slug" },
+        "type": {
+          "type": "string",
+          "enum": ["string", "number", "boolean"],
+          "description": "Value type. Extraction is LLM-driven; the worker coerces and drops values that do not parse."
+        },
+        "description": {
+          "type": "string",
+          "description": "What the value means. Used verbatim in the extraction prompt — write it for the LLM, e.g. 'Order reference, format ORD-XXXXX'."
+        },
+        "enum": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Optional closed set of allowed values (string type only)."
+        }
+      }
+    },
+    "model_override": {
+      "type": "object",
+      "required": ["provider", "name"],
+      "additionalProperties": false,
+      "description": "Per-step LLM override. Omit to use the agent's llm_primary. NOTE: inside a workflow the classic LLM FallbackAdapter chain does not apply; a step-model failure surfaces as an LLM error for the whole turn.",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["openai", "google", "anthropic"],
+          "description": "v1 supported step-model providers (each maps to a langchain-<provider> package shipped with the worker)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Model name as the provider API expects it, e.g. 'gpt-5.4-mini', 'gemini-2.5-flash'."
+        },
+        "settings": {
+          "type": "object",
+          "default": {},
+          "description": "Provider kwargs passed through to the LangChain chat model unchanged (temperature, reasoning_effort, service_tier, ...). Same pass-through philosophy as model.settings on classic agents."
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "required": ["to", "when"],
+      "additionalProperties": false,
+      "properties": {
+        "to": {
+          "type": "string",
+          "description": "Target step id. Must exist in steps[]."
+        },
+        "when": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Natural-language routing condition, evaluated after each user turn by a structured-output router call on the step's model. Write it as a predicate over the conversation, e.g. 'caller has confirmed the booking details'. First matching transition (array order) wins; if none match the conversation stays on the current step."
+        }
+      }
+    },
+    "llm_step": {
+      "type": "object",
+      "required": ["id", "type", "prompt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "type": { "const": "llm" },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Step-scoped system prompt. Supports the same {Variable} substitutions as the classic agent prompt (SystemPromptFormatter: {TodayDateTime}, {UserMessageCount}, {RoomName}, ...) plus {state.<field>} for collected state. Keep it small — it is sent on every turn while the step is active."
+        },
+        "model": { "$ref": "#/$defs/model_override" },
+        "routing": {
+          "$ref": "#/$defs/routing_override",
+          "description": "Optional node-level override of the flow-level routing, applied to every transition LEAVING this step (its go_to_* tool schemas and the directive their tool result returns). Only the fields present here override; the rest inherit the flow-level routing."
+        },
+        "tools": {
+          "type": "array",
+          "default": [],
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/slug" },
+          "description": "Names of tools[] entries available to the LLM while this step is active."
+        },
+        "collect": {
+          "type": "array",
+          "default": [],
+          "items": { "$ref": "#/$defs/slug" },
+          "description": "state_fields[] names this step tries to extract from the conversation after each user turn. Already-filled fields are not re-extracted unless the user corrects them."
+        },
+        "transitions": {
+          "type": "array",
+          "default": [],
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/transition" },
+          "description": "Outgoing edges, evaluated in order after each user turn. An llm step with no transitions is a terminal conversational step (the call continues there until the user hangs up or an end step is reached via a tool/other path)."
+        }
+      }
+    },
+    "end_step": {
+      "type": "object",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "type": { "const": "end" },
+        "final_message": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Optional fixed line spoken (TTS) before ending. Plain text, no LLM call; supports the same {Variable}/{state.<field>} substitutions as prompts."
+        },
+        "terminate_call": {
+          "type": "boolean",
+          "default": true,
+          "description": "true: end the session through the existing terminate-call path (room cleanup, end-of-call extractors, billing all fire as usual). false: speak final_message (if any) and go silent without hanging up — for widget flows where the frontend owns closing."
+        }
+      }
+    },
+    "global_node_fields": {
+      "type": "object",
+      "description": "Fields shared by every global node (mixed into global_llm_step / global_end_step). 'when' is the single routing predicate authored once and reused as the go_to_<id> tool description on every in-scope step; 'exclude' opts specific source llm steps out.",
+      "properties": {
+        "when": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Natural-language routing condition under which any step should transition to this global node, e.g. 'caller wants to end the call or has no further questions'. Authored once here instead of per source step. Filled into the flow/source-step transition_description_template as {when} on every step that can reach this node."
+        },
+        "exclude": {
+          "type": "array",
+          "default": [],
+          "items": { "$ref": "#/$defs/slug" },
+          "description": "Ids of llm steps that should NOT be able to transition to this global node (default: every llm step can). Each entry must name an existing llm step (in steps[] or another global llm node)."
+        }
+      }
+    },
+    "global_llm_step": {
+      "type": "object",
+      "required": ["id", "type", "prompt", "when"],
+      "additionalProperties": false,
+      "description": "A global node that is an llm step: reachable from every in-scope step, and once landed on it behaves as an ordinary active step (its prompt/tools/collect/transitions apply, and other global nodes remain reachable from it). There is NO automatic return to the previous step — author its transitions[] if it should hand back. Same fields as llm_step plus the global 'when'/'exclude'.",
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "type": { "const": "llm" },
+        "prompt": { "type": "string", "minLength": 1, "description": "Same as llm_step.prompt." },
+        "model": { "$ref": "#/$defs/model_override" },
+        "routing": { "$ref": "#/$defs/routing_override" },
+        "tools": { "type": "array", "default": [], "maxItems": 16, "items": { "$ref": "#/$defs/slug" } },
+        "collect": { "type": "array", "default": [], "items": { "$ref": "#/$defs/slug" } },
+        "transitions": { "type": "array", "default": [], "maxItems": 8, "items": { "$ref": "#/$defs/transition" } },
+        "when": { "$ref": "#/$defs/global_node_fields/properties/when" },
+        "exclude": { "$ref": "#/$defs/global_node_fields/properties/exclude" }
+      }
+    },
+    "global_end_step": {
+      "type": "object",
+      "required": ["id", "type", "when"],
+      "additionalProperties": false,
+      "description": "A global node that is an end step: the canonical exit-condition node (e.g. say_goodbye_and_terminate_call) any step can transition to. Same fields as end_step plus the global 'when'/'exclude'.",
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "type": { "const": "end" },
+        "final_message": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Same as end_step.final_message."
+        },
+        "terminate_call": { "type": "boolean", "default": true, "description": "Same as end_step.terminate_call." },
+        "when": { "$ref": "#/$defs/global_node_fields/properties/when" },
+        "exclude": { "$ref": "#/$defs/global_node_fields/properties/exclude" }
+      }
+    },
+    "http_tool": {
+      "type": "object",
+      "required": ["name", "kind", "description", "request"],
+      "additionalProperties": false,
+      "description": "Self-contained REST tool defined in the flow. The worker synthesizes an _internal_execute_rest_api tool from it and runs it through the agent's existing REST executor — no entry in the agent's custom_tool_configurations is needed.",
+      "properties": {
+        "name": { "$ref": "#/$defs/slug" },
+        "kind": { "const": "http" },
+        "description": {
+          "type": "string",
+          "description": "What the tool does and when to call it. Sent to the LLM — keep concise, it costs context every turn the tool is in scope."
+        },
+        "parameters": {
+          "type": "object",
+          "default": { "type": "object", "properties": {} },
+          "description": "JSON Schema for the LLM-provided arguments (same convention as llm_provided_params_schema in custom_tool_configurations)."
+        },
+        "param_mapping": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Routes each LLM-provided argument into the request, e.g. {\"postcode\": \"body_json.postcode\"}. When omitted, every declared parameter defaults to body_json.<name>. Targets follow the custom_tool_configurations convention (body_json.*, headers.*)."
+        },
+        "pre_execution_speech": {
+          "type": "string",
+          "description": "Spoken by the worker the moment the tool is called, BEFORE the request runs. Decouples the 'let me check…' line from the model's text generation (the model only emits the tool call, never a stalling text-only turn) and masks request latency. Static string — for a multilingual agent omit it or localise per agent."
+        },
+        "pre_execution_speech_allow_interruption": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the caller may interrupt the pre_execution_speech."
+        },
+        "request": {
+          "type": "object",
+          "required": ["method", "url"],
+          "additionalProperties": false,
+          "properties": {
+            "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+            "url": {
+              "type": "string",
+              "description": "Absolute request URL (used verbatim as the REST url_template)."
+            },
+            "headers": {
+              "type": "object",
+              "default": {},
+              "additionalProperties": { "type": "string" },
+              "description": "Static request headers."
+            },
+            "body": {
+              "type": ["object", "null"],
+              "default": null,
+              "description": "Static JSON body base for POST/PUT/PATCH. Mapped LLM arguments (see param_mapping) are merged into it at call time."
+            },
+            "timeout_sec": {
+              "type": "number",
+              "default": 5,
+              "minimum": 1,
+              "maximum": 30,
+              "description": "Request timeout. On timeout/error the LLM receives a tool error message and keeps the conversation going."
+            }
+          }
+        }
+      }
+    },
+    "agent_tool_ref": {
+      "type": "object",
+      "required": ["name", "kind", "ref"],
+      "additionalProperties": false,
+      "description": "Reference (by llm_function_name) to a tool already defined in the agent's custom_tool_configurations, exposed natively to the step's LiveKit agent. HYBRID RUNTIME (ADR-011): because tools run natively rather than inside a graph, escalate_to_human_phone_call and other session tools ARE allowed (a transfer step typically refs escalate_to_human_phone_call). The earlier blanket ban applied only to the rejected LLMAdapter design.",
+      "properties": {
+        "name": { "$ref": "#/$defs/slug" },
+        "kind": { "const": "agent_tool" },
+        "ref": {
+          "type": "string",
+          "description": "llm_function_name of the entry in custom_tool_configurations to expose to this workflow."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "entry_step": "greet",
+  "routing": {
+    "acknowledgment_required": true,
+    "acknowledgment_description": "A brief phrase to say now while switching, e.g. 'Sure, one moment!'. Under six words, no question.",
+    "transition_description_template": "Call as soon as {when}.",
+    "continuation_directive": "You are now on the next step. You already said a short filler, so do not re-greet or repeat it — continue directly with this step's task.",
+    "continuation_directive_no_filler": "You are now on the next step. Do not re-greet — continue directly with this step's task."
+  },
+  "shared_prompt": "You are {agent_name}, a friendly support agent for Acme. Today is {TodayDateTime}. Speak in short, natural sentences and ask only one question at a time. Never invent order or refund details — use only what the tools return or what the caller tells you.",
+  "state_fields": [
+    { "name": "customer_name", "type": "string", "description": "The caller's first name, as they introduce themselves." },
+    { "name": "order_id", "type": "string", "description": "Order reference, format ORD-12345." },
+    { "name": "issue_kind", "type": "string", "description": "What the caller needs help with.", "enum": ["delivery", "refund", "other"] },
+    { "name": "refund_amount", "type": "number", "description": "The refund amount in pounds the caller is requesting." },
+    { "name": "issue_resolved", "type": "boolean", "description": "true once the caller confirms their question was fully answered." }
+  ],
+  "steps": [
+    {
+      "id": "greet",
+      "type": "llm",
+      "prompt": "Greet the caller once, ask their first name and how you can help today.",
+      "collect": ["customer_name", "issue_kind"],
+      "transitions": [
+        { "to": "order_lookup", "when": "the caller asks about a specific order or a delivery" },
+        { "to": "refund", "when": "the caller wants a refund" }
+      ]
+    },
+    {
+      "id": "order_lookup",
+      "type": "llm",
+      "prompt": "Help {state.customer_name} with their order. If you do not already have the order id, ask for it once, then call check_order_status and explain the result in one short sentence.",
+      "model": { "provider": "openai", "name": "gpt-5.4-mini", "settings": { "temperature": 0.2 } },
+      "tools": ["check_order_status"],
+      "collect": ["order_id", "issue_resolved"],
+      "transitions": [
+        { "to": "wrap_up", "when": "the order question is resolved and the caller has nothing else" }
+      ]
+    },
+    {
+      "id": "refund",
+      "type": "llm",
+      "prompt": "Take the refund request from {state.customer_name}. Confirm the order id and the amount, then say the refund team will process it within five working days.",
+      "routing": { "acknowledgment_required": false },
+      "collect": ["order_id", "refund_amount", "issue_resolved"],
+      "transitions": [
+        { "to": "human", "when": "the caller disputes the outcome or explicitly asks to speak to a person" },
+        { "to": "wrap_up", "when": "the refund request is captured and the caller has nothing else" }
+      ]
+    },
+    {
+      "id": "human",
+      "type": "llm",
+      "prompt": "Tell the caller you will connect them to a specialist now, then call connect_specialist.",
+      "tools": ["connect_specialist"],
+      "transitions": []
+    },
+    {
+      "id": "wrap_up",
+      "type": "end",
+      "final_message": "Thanks for calling Acme, {state.customer_name}. Goodbye!",
+      "terminate_call": true
+    }
+  ],
+  "global_steps": [
+    {
+      "id": "say_goodbye",
+      "type": "end",
+      "when": "the caller clearly signals they are finished from any step — a standalone 'bye' or 'goodbye', or they say they have nothing else. Do not trigger on 'thanks' or 'that's fine' said mid-task.",
+      "final_message": "Thanks for calling Acme. Goodbye!",
+      "terminate_call": true,
+      "exclude": ["human"]
+    },
+    {
+      "id": "faq",
+      "type": "llm",
+      "prompt": "Answer the caller's general question about Acme (opening hours, locations, returns policy) in one short sentence using only known facts, then ask if there is anything else.",
+      "when": "the caller asks a general question about hours, locations, or policy that is not tied to a specific order",
+      "collect": ["issue_resolved"],
+      "transitions": [
+        { "to": "wrap_up", "when": "the question is answered and the caller has nothing else" }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "check_order_status",
+      "kind": "http",
+      "description": "Look up the current status of an order by its order id.",
+      "parameters": {
+        "type": "object",
+        "required": ["order_id"],
+        "properties": { "order_id": { "type": "string", "description": "Order reference, format ORD-12345." } }
+      },
+      "param_mapping": { "order_id": "body_json.order_id" },
+      "pre_execution_speech": "Let me pull up that order for you.",
+      "request": {
+        "method": "POST",
+        "url": "https://api.acme.example/orders/status",
+        "headers": { "Authorization": "Bearer REPLACE_WITH_TOKEN" },
+        "body": {},
+        "timeout_sec": 8
+      }
+    },
+    {
+      "name": "connect_specialist",
+      "kind": "agent_tool",
+      "ref": "escalate_to_human_phone_call"
+    }
+  ]
+}
